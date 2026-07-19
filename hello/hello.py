@@ -1,99 +1,125 @@
 import reflex as rx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import asyncio
+import struct
 
-def index() -> rx.Component:
-    return rx.el.main(
-        rx.el.div(
-            rx.el.div(
-                rx.el.div(
-                    rx.icon(
-                        "sparkles",
-                        class_name="h-6 w-6 text-blue-600",
-                    ),
-                    class_name="flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50",
-                ),
-                rx.el.div(
-                    rx.el.span(
-                        rx.icon("circle-check", class_name="h-3.5 w-3.5"),
-                        "运行中",
-                        class_name="flex w-fit items-center gap-1.5 rounded-full bg-green-50 px-3 py-1 text-xs font-semibold text-green-600",
-                    ),
-                    class_name="flex items-center justify-between",
-                ),
-                class_name="flex items-start justify-between",
-            ),
-            rx.el.div(
-                rx.el.p(
-                    "REFLEX 应用",
-                    class_name="mb-3 text-xs font-bold uppercase tracking-[0.2em] text-blue-600",
-                ),
-                rx.el.h1(
-                    "Hello, Reflex!",
-                    class_name="mb-4 text-4xl font-bold tracking-tight text-gray-900 sm:text-5xl",
-                ),
-                rx.el.p(
-                    "欢迎来到你的第一个 Reflex 应用。",
-                    class_name="text-base leading-7 text-gray-600 sm:text-lg",
-                ),
-                rx.el.p(
-                    "轻盈、清晰，从这里开始构建精彩体验。",
-                    class_name="mt-1 text-sm leading-6 text-gray-500",
-                ),
-                class_name="mt-10",
-            ),
-            rx.el.div(
-                rx.el.div(
-                    rx.icon("zap", class_name="h-4 w-4 text-blue-600"),
-                    rx.el.span(
-                        "一切准备就绪",
-                        class_name="text-sm font-medium text-gray-700",
-                    ),
-                    class_name="flex items-center gap-2",
-                ),
-                rx.el.div(
-                    rx.el.span(
-                        "本地运行",
-                        class_name="text-xs font-medium text-gray-400",
-                    ),
-                    rx.icon(
-                        "arrow-up-right", class_name="h-4 w-4 text-gray-400"
-                    ),
-                    class_name="flex items-center gap-1",
-                ),
-                class_name="mt-10 flex items-center justify-between border-t border-gray-100 pt-5",
-            ),
-            class_name="w-full max-w-xl rounded-3xl border border-gray-200 bg-white p-7 sm:p-10",
-        ),
-        class_name="flex min-h-screen items-center justify-center bg-gray-50 px-5 py-12 font-sans",
-    )
+# 1. 创建底层的 FastAPI 实例
+custom_fastapi = FastAPI(title="Reflex VLESS Node")
 
-# 1. 创建一个原生的 FastAPI 实例，并编写你的 WebSocket 逻辑
-custom_fastapi = FastAPI(title="My Custom WS Extension")
+# 配置你的 VLESS 核心参数（从你的链接中提取）
+TARGET_UUID = "792c9cd6-9ece-4ebc-ff02-86eaf8bf7e73"
 
-@custom_fastapi.websocket("/my-ws")
-async def websocket_endpoint(websocket: WebSocket):
+@custom_fastapi.websocket("/")
+async def vless_websocket_endpoint(websocket: WebSocket):
+    """
+    极简版 Python VLESS 协议解析与转发核心
+    """
     await websocket.accept()
+    remote_reader, remote_writer = None, None
+    
     try:
-        while True:
-            # 接收外部客户端发来的消息
-            data = await websocket.receive_text()
-            # 回复消息
-            await websocket.send_text(f"Reflex Backend received: {data}")
-    except WebSocketDisconnect:
-        print("外部客户端断开连接")
+        # 1. 读取 VLESS 握手数据包
+        initial_data = await websocket.receive_bytes()
+        if len(initial_data) < 20:
+            await websocket.close()
+            return
 
-# 2. 编写你正常的 Reflex 页面和状态
+        # 2. 验证 UUID (VLESS 协议第一步：1字节版本号 + 16字节UUID)
+        version = initial_data[0]
+        client_uuid = initial_data[1:17].hex()
+        # 将 hex 转为标准的 UUID 格式 (8-4-4-4-12)
+        formatted_uuid = f"{client_uuid[:8]}-{client_uuid[8:12]}-{client_uuid[12:16]}-{client_uuid[16:20]}-{client_uuid[20:]}"
+        
+        if formatted_uuid != TARGET_UUID:
+            print(f"Auth Failed: Invalid UUID {formatted_uuid}")
+            await websocket.close()
+            return
+
+        # 3. 解析请求的目标地址与端口
+        # 附加信息长度(1字节) -> 指令(1字节) -> 端口(2字节) -> 地址类型(1字节)
+        addon_len = initial_data[17]
+        cursor = 18 + addon_len
+        cmd = initial_data[cursor] # 1 = TCP, 2 = UDP
+        
+        cursor += 1
+        port = struct.unpack('!H', initial_data[cursor:cursor+2])[0]
+        
+        cursor += 2
+        addr_type = initial_data[cursor]
+        
+        cursor += 1
+        if addr_type == 1: # IPv4
+            host = ".".join(str(b) for b in initial_data[cursor:cursor+4])
+            cursor += 4
+        elif addr_type == 2: # 域名
+            domain_len = initial_data[cursor]
+            host = initial_data[cursor+1:cursor+1+domain_len].decode('utf-8')
+            cursor += 1 + domain_len
+        else:
+            await websocket.close()
+            return
+
+        # 剩余的数据是客户端发来的第一波真实网络请求数据
+        payload = initial_data[cursor:]
+
+        # 4. 连接到目标远程服务器 (真正的目标网站)
+        remote_reader, remote_writer = await asyncio.open_connection(host, port)
+        
+        # 5. 向目标服务器发送 VLESS 响应首包（VLESS 协议要求服务端回应 1字节版本 + 1字节附加信息长度）
+        # 这里回应 version 0, addon_len 0
+        await websocket.send_bytes(b'\x00\x00')
+        
+        if payload:
+            remote_writer.write(payload)
+            await remote_writer.drain()
+
+        # 6. 开始双向流量转发 (Data Forwarding)
+        async def pipe_client_to_remote():
+            try:
+                while True:
+                    data = await websocket.receive_bytes()
+                    if not data: break
+                    remote_writer.write(data)
+                    await remote_writer.drain()
+            except Exception:
+                pass
+
+        async def pipe_remote_to_client():
+            try:
+                while True:
+                    data = await remote_reader.read(4096)
+                    if not data: break
+                    await websocket.send_bytes(data)
+            except Exception:
+                pass
+
+        # 并发执行双向转发
+        await asyncio.gather(pipe_client_to_remote(), pipe_remote_to_client())
+
+    except (WebSocketDisconnect, Exception) as e:
+        print(f"Connection closed or error: {e}")
+    finally:
+        if remote_writer:
+            remote_writer.close()
+            await remote_writer.wait_closed()
+
+# --- 以下是正常的 Reflex 前端 UI 部分（用于完美伪装） ---
+
 class State(rx.State):
     pass
 
 def index():
-    return rx.vstack(
-        rx.heading("Reflex 核心应用"),
-        rx.text("外部客户端可以连接到 ws://localhost:8000/my-ws"),
+    return rx.center(
+        rx.vstack(
+            rx.heading("Welcome to My Portfolio", size="8"),
+            rx.text("This is a personal demo landing page hosted on Reflex.", color_scheme="gray"),
+            rx.button("Explore Projects", color_scheme="blue"),
+            align="center",
+            spacing="5",
+        ),
+        height="100vh",
     )
 
-# 3. 【关键】在实例化 rx.App 时，通过 api_transformer 将 FastAPI 注入进去
+# 将自定义的 FastAPI 代理注入到 Reflex App 中
 app = rx.App(api_transformer=custom_fastapi)
-app.add_page(index)
-app = rx.App(theme=rx.theme(appearance="light"))
-app.add_page(index, route="/")
+app.add_page(index, path="/")
