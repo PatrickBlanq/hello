@@ -122,4 +122,5 @@ def index():
 
 # 将自定义的 FastAPI 代理注入到 Reflex App 中
 app = rx.App(api_transformer=custom_fastapi)
-app.add_page(index, path="/")
+# 修改后的正确代码（将 path 改为 route）
+app.add_page(index, route="/")
